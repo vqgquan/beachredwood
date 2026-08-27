@@ -1,0 +1,18 @@
+{
+  "episodes": 1200,
+  "alpha": 0.2,
+  "gamma": 0.95,
+  "epsilonStart": 1.0,
+  "epsilonEnd": 0.05,
+  "epsilonDecayEpisodes": 700,
+  "maxStepsPerEpisode": 400,
+  "fpsVisual": 30,
+  "fpsFast": 1000,
+  "rapidStepsPerFrame": 25,
+  "rapidRenderEvery": 20,
+  "monsterMoveProbability": 0.4,
+  "intrinsicRewardStrength": 0.2,
+  "tileSize": 48,
+  "panelWidth": 320,
+  "seed": 42
+}
