@@ -1,1 +1,9 @@
 /part2/models/checkpoints
+
+.note
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+
