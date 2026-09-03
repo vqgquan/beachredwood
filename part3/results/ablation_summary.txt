@@ -1,5 +1,0 @@
-config                 axis          mean_reward      std   train_s
-baseline               baseline           -14.05     9.36     331.4
-no_shaping             shaping            -22.38     0.70     305.4
-no_spawner_feature     observation        -22.43     0.24     308.1
-bigger_network         network             -4.65     0.39     360.3

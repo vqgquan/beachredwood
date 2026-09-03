@@ -1,6 +1,0 @@
-name,axis,learning_rate,net_arch,ent_coef,timesteps,mean_reward,std_reward,train_time_sec,note
-baseline,-,0.0003,64x64,0.005,800000,-14.05,9.36,487.4,
-lr_low,learning_rate,0.0001,64x64,0.005,800000,-21.92,0.36,432.9,Is 3e-4 too fast? A smaller step should be steadier but slower.
-lr_high,learning_rate,0.001,64x64,0.005,800000,-3.6,0.9,526.7,Is 3e-4 too slow? A larger step may break through sooner or diverge.
-ent_default,ent_coef,0.0003,64x64,0.0,800000,-21.88,0.59,436.2,"ent_coef=0.005 is non-default. Does the extra exploration bonus actually earn its place, or would SB3's default 0.0 do as well?"
-net_big,net_arch,0.0003,128x128,0.005,800000,-22.2,0.33,508.5,Capacity check. Part III studies this axis in depth; here it is only to complete the hyperparameter table.

@@ -1,12 +1,6 @@
-gymnasium>=1.0
-stable-baselines3>=2.3
-torch>=2.0
+gymnasium>=0.29
 pygame>=2.5
 numpy>=1.24
-matplotlib>=3.7
-pytest>=7.0
-
-# optional, only needed if you want --tensorboard style live training curves
-tensorboard
-tqdm
-rich
+stable-baselines3>=2.2
+torch>=2.0
+tensorboard>=2.13
