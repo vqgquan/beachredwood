@@ -90,6 +90,7 @@ def _tensorboard_available() -> bool:
 
 
 def build_ppo(env, net_arch=(64, 64), learning_rate: float = 3e-4,
+              ent_coef: float = 0.005,
               tensorboard_log: Optional[str] = None, seed: int = SEED) -> PPO:
     """PPO(MlpPolicy) with the architecture doc's stated rationale:
     on-policy, fewer hyperparameter traps than DQN for this obs space.
@@ -110,7 +111,7 @@ def build_ppo(env, net_arch=(64, 64), learning_rate: float = 3e-4,
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.005,
+        ent_coef=ent_coef,
         policy_kwargs=policy_kwargs,
         tensorboard_log=tensorboard_log,
         seed=seed,
