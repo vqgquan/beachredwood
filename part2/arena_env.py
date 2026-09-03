@@ -1,477 +1,250 @@
 """
 arena_env.py
-Real-time Pygame arena + Gym(nasium) environment.
+============
+Thin Gymnasium adapter around ArenaSimulation. This is the ONLY module that
+knows about RL concepts (observation vectors, action spaces, reward
+shaping, episode termination semantics). Game rules live in
+arena_simulation.py.
 
-The scene: one player ship, spawners that keep producing enemies,
-enemies that chase the player, bullets, health bars and phases.
-Destroy every spawner -> next phase (harder).
+Reward (matches architecture doc, potential-based shaping per
+Ng, Harada & Russell 1999 -- provably preserves the optimal policy):
 
-Two control schemes are supported by the same class:
-  scheme="rotation" -> 5 actions (noop, thrust, rotate left, rotate right, shoot)
-  scheme="direct"   -> 6 actions (noop, up, down, left, right, shoot)
+    +1.0   bullet hits an enemy
+    +5.0   spawner destroyed
+    +10.0  phase completed
+    -0.5   player takes damage (per damage EVENT, not per hp point)
+    -15.0  player dies (terminal)
+    + shaping: r_shape = gamma * Phi(s') - Phi(s)
+               Phi(s) = -k * dist(player, nearest_active_spawner)
+
+`k` and `gamma` are constructor args so Part III's ablation study (shaping
+on/off) can toggle this cleanly by setting shaping_enabled=False.
 """
 
+from __future__ import annotations
+
 import math
+from typing import Optional
+
 import numpy as np
-import pygame
 import gymnasium as gym
 from gymnasium import spaces
 
-# ----------------------------------------------------------------------
-# Arena constants (simple physics, easy to tweak)
-# ----------------------------------------------------------------------
-WIDTH, HEIGHT = 960, 680
-DIAG = math.hypot(WIDTH, HEIGHT)        # longest possible distance, used to normalise
-FPS = 30                                 # simulation ticks per second
-DT = 1.0 / FPS                           # fixed time step (seconds)
-MAX_STEPS = 2400                         # game ticks, ~80 seconds per episode
-FRAME_SKIP = 2                           # each agent action is held for this many ticks
+from arena_simulation import (
+    ArenaSimulation, ARENA_SIZE, MAX_SPEED, PLAYER_MAX_HP,
+    MAX_EPISODE_TIME, MAX_ENEMIES_EXPECTED, DEFAULT_PHASES,
+)
 
-# Player
-P_RADIUS = 14
-P_ACCEL = 700.0          # px/s^2 when thrusting / moving
-P_MAX_SPEED = 320.0      # px/s
-P_DRAG = 1.8             # velocity damping per second
-P_ROT_SPEED = 4.0        # rad/s for the rotation scheme
-P_MAX_HP = 100.0
-SHOOT_COOLDOWN = 0.15    # seconds between shots
+OBS_DIM = 15
 
-# Bullets
-B_SPEED = 620.0
-B_RADIUS = 6            # slightly fat bullets: hits are easier to discover
-B_DAMAGE = 10.0
-B_LIFETIME = 1.4         # seconds before the bullet disappears
-
-# Enemies
-E_RADIUS = 12
-E_BASE_SPEED = 80.0      # +10 px/s per phase
-E_MAX_HP = 20.0
-E_TOUCH_DAMAGE = 6.0
-E_TOUCH_COOLDOWN = 0.8   # an enemy cannot hurt the player more often than this
-MAX_ENEMIES = 10         # global cap so the scene stays manageable
-
-# Spawners
-S_RADIUS = 22
-S_BASE_HP = 45.0         # +20 per phase (about 5 bullets in phase 1)
-S_BASE_INTERVAL = 2.5    # seconds between spawns, shrinks with the phase
-
-# Colours
-C_BG = (14, 16, 24)
-C_PLAYER = (90, 220, 255)
-C_BULLET = (255, 240, 150)
-C_ENEMY = (255, 90, 110)
-C_SPAWNER = (200, 120, 255)
-C_TEXT = (235, 235, 245)
+# Reward constants -- kept as module-level defaults, overridable per-instance
+R_ENEMY_HIT = 1.0
+R_SPAWNER_DESTROYED = 5.0
+R_PHASE_COMPLETE = 10.0
+R_DAMAGE_TAKEN = -0.5
+R_DEATH = -15.0
 
 
-# ----------------------------------------------------------------------
-# Small helper objects (plain classes, no pygame sprites needed)
-# ----------------------------------------------------------------------
-class Bullet:
-    """A player bullet flying in a straight line."""
-
-    def __init__(self, x, y, dx, dy):
-        self.x, self.y = x, y
-        self.vx, self.vy = dx * B_SPEED, dy * B_SPEED
-        self.life = B_LIFETIME
-
-    def update(self, dt):
-        self.x += self.vx * dt
-        self.y += self.vy * dt
-        self.life -= dt
-
-
-class Enemy:
-    """An enemy that walks straight at the player and hurts it on contact."""
-
-    def __init__(self, x, y, speed):
-        self.x, self.y = x, y
-        self.speed = speed
-        self.hp = E_MAX_HP
-        self.touch_cd = 0.0
-
-    def update(self, dt, px, py):
-        dx, dy = px - self.x, py - self.y
-        d = math.hypot(dx, dy) + 1e-8
-        self.x += (dx / d) * self.speed * dt
-        self.y += (dy / d) * self.speed * dt
-        self.touch_cd = max(0.0, self.touch_cd - dt)
-
-
-class Spawner:
-    """A static building that periodically releases enemies."""
-
-    def __init__(self, x, y, hp, interval):
-        self.x, self.y = x, y
-        self.hp = hp
-        self.max_hp = hp
-        self.interval = interval
-        self.timer = interval * 0.5   # first enemy comes a bit earlier
-
-    def update(self, dt):
-        """Returns True when it is time to spawn an enemy."""
-        self.timer -= dt
-        if self.timer <= 0.0:
-            self.timer = self.interval
-            return True
-        return False
-
-
-# ----------------------------------------------------------------------
-# The environment
-# ----------------------------------------------------------------------
 class ArenaEnv(gym.Env):
-    """Gym-style API: reset(), step(action), render()."""
+    """Gymnasium environment for the Arena mini-game.
 
-    metadata = {"render_modes": ["human"], "render_fps": FPS}
+    Parameters
+    ----------
+    control_scheme : "rotate" | "direct"
+        "rotate"  -> Discrete(5): noop, turn_left, turn_right, thrust, fire
+        "direct"  -> Discrete(6): noop, up, down, left, right, fire
+    shaping_enabled : bool
+        Toggle potential-based reward shaping. Used by the Part III
+        ablation study (with/without shaping).
+    include_spawner_feature : bool
+        If False, the 3 "nearest spawner" observation dims (Δx,Δy,dist)
+        are zeroed out. Used by the Part III ablation study
+        (full observation vs. spawner-feature ablated).
+    shaping_k : float
+        Potential function scale k in Phi(s) = -k * dist(...).
+    max_time : float
+        Episode time budget in seconds (drives truncation).
+    render_mode : "human" | None
+        Only set to "human" in eval scripts; training must stay headless.
+    """
 
-    # ---- reward weights (all explained in the README) ----
-    R_STEP = -0.02          # time cost: hiding for a whole episode must not pay
-    R_HIT = 0.05            # a bullet connected (dense feedback for aiming)
-    R_AIM = 0.01            # fired while actually lined up on a target
-    R_ENEMY_KILL = 2.0      # destroyed an enemy
-    R_SPAWNER_KILL = 20.0   # destroyed a spawner (the real objective)
-    R_PHASE = 30.0          # cleared every spawner -> next phase
-    R_DAMAGE = -0.10        # per hit point lost (one enemy touch = -0.6)
-    R_DEATH = -20.0         # terminal penalty
-    R_SHAPE = 3.0           # potential-based shaping toward the nearest spawner
+    metadata = {"render_modes": ["human"], "render_fps": 30}
 
-    def __init__(self, scheme="rotation", render_mode=None,
-                 max_steps=MAX_STEPS, frame_skip=FRAME_SKIP):
+    def __init__(self,
+                 control_scheme: str = "rotate",
+                 shaping_enabled: bool = True,
+                 include_spawner_feature: bool = True,
+                 shaping_k: float = 0.01,
+                 gamma: float = 0.99,
+                 max_time: float = MAX_EPISODE_TIME,
+                 phases: Optional[list] = None,
+                 render_mode: Optional[str] = None,
+                 seed: Optional[int] = None):
         super().__init__()
-        assert scheme in ("rotation", "direct")
-        self.scheme = scheme
+        assert control_scheme in ("rotate", "direct")
+        self.control_scheme = control_scheme
+        self.shaping_enabled = shaping_enabled
+        self.include_spawner_feature = include_spawner_feature
+        self.shaping_k = shaping_k
+        self.gamma = gamma
         self.render_mode = render_mode
-        self.frame_skip = frame_skip
-        # max_steps counts agent decisions, so divide the game length by the skip
-        self.max_steps = max_steps // frame_skip
 
-        # 5 actions for the rotation scheme, 6 for the direct scheme
-        self.action_space = spaces.Discrete(5 if scheme == "rotation" else 6)
-        # fixed size observation: 24 floats, no pixels
-        self.observation_space = spaces.Box(-5.0, 5.0, shape=(24,), dtype=np.float32)
+        self.sim = ArenaSimulation(
+            control_scheme=control_scheme,
+            phases=phases if phases is not None else DEFAULT_PHASES,
+            max_time=max_time,
+        )
+        if seed is not None:
+            self.sim.rng.seed(seed)
 
-        # pygame surfaces are only created when render() is called
-        self.screen = None
-        self.clock = None
-        self.font = None
+        self.action_space = spaces.Discrete(5 if control_scheme == "rotate" else 6)
+        self.observation_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(OBS_DIM,), dtype=np.float32
+        )
 
-    # ------------------------------------------------------------------
-    # reset
-    # ------------------------------------------------------------------
-    def reset(self, seed=None, options=None):
-        """Start a new episode and return the first observation."""
+        self._dt = 1.0 / 30.0  # fixed physics timestep (30 Hz)
+        self._prev_potential = 0.0
+        self._screen = None  # lazily created pygame surface for render()
+
+    # ------------------------------------------------------------------ #
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
+        if seed is not None:
+            self.sim.rng.seed(seed)
+        self.sim.reset()
+        obs = self._build_observation()
+        self._prev_potential = self._potential()
+        return obs, {}
 
-        self.steps = 0
-        self.phase = 1
-        self.px, self.py = WIDTH / 2, HEIGHT / 2
-        self.vx, self.vy = 0.0, 0.0
-        self.angle = 0.0                 # heading in radians (rotation scheme)
-        self.aim = (1.0, 0.0)            # last facing direction (direct scheme)
-        self.hp = P_MAX_HP
-        self.cooldown = 0.0
+    def step(self, action: int):
+        control_input = self._action_to_control(action)
+        events = self.sim.step_physics(self._dt, control_input)
 
-        self.bullets, self.enemies = [], []
-        self.spawners = []
-        self._build_phase()
+        reward = 0.0
+        reward += events["enemies_killed"] * R_ENEMY_HIT
+        reward += events["spawners_destroyed"] * R_SPAWNER_DESTROYED
+        if events["phase_completed"]:
+            reward += R_PHASE_COMPLETE
+        if events["damage_taken"] > 0:
+            reward += R_DAMAGE_TAKEN
+        if events["player_died"]:
+            reward += R_DEATH
 
-        self.kills = 0
-        self.spawners_destroyed = 0
-        self.prev_spawner_dist = self._nearest(self.spawners)[0]
+        if self.shaping_enabled:
+            new_potential = self._potential()
+            reward += self.gamma * new_potential - self._prev_potential
+            self._prev_potential = new_potential
 
-        return self._get_obs(), {}
+        terminated = bool(events["player_died"] or events["episode_won"])
+        truncated = bool(self.sim.done and not terminated)  # timeout path
 
-    def _build_phase(self):
-        """Place the spawners of the current phase away from the player."""
-        n = min(1 + self.phase, 5)   # phase 1 starts with only 2 spawners
-        hp = S_BASE_HP + 20.0 * (self.phase - 1)
-        interval = max(0.9, S_BASE_INTERVAL - 0.25 * (self.phase - 1))
-        self.spawners = []
-        while len(self.spawners) < n:
-            x = self.np_random.uniform(60, WIDTH - 60)
-            y = self.np_random.uniform(60, HEIGHT - 60)
-            if math.hypot(x - self.px, y - self.py) > 220:   # not on top of the player
-                self.spawners.append(Spawner(x, y, hp, interval))
+        obs = self._build_observation()
+        info = {
+            "phase_index": self.sim.phase_index,
+            "episode_won": events["episode_won"],
+            "enemies_killed": events["enemies_killed"],
+            "spawners_destroyed": events["spawners_destroyed"],
+        }
+        return obs, reward, terminated, truncated, info
 
-    # ------------------------------------------------------------------
-    # step
-    # ------------------------------------------------------------------
-    def step(self, action):
-        """Apply one action, advance the simulation, return the result.
-
-        The action is repeated for `frame_skip` game ticks. This shortens the
-        decision horizon (easier credit assignment) and lets one "shoot"
-        decision actually fire a bullet instead of being lost to the cooldown.
-        """
-        action = int(action)
-        reward = self.R_STEP
-        self.steps += 1
-
-        for _ in range(self.frame_skip):
-            self.cooldown = max(0.0, self.cooldown - DT)
-            reward += self._apply_action(action)
-            self._move_player()
-            reward += self._update_bullets()
-            reward += self._update_enemies()
-            self._update_spawners()
-            if self.hp <= 0.0:
-                break
-
-        # phase progression: every spawner of this phase is gone
-        phase_changed = False
-        if not self.spawners:
-            self.phase += 1
-            self._build_phase()
-            reward += self.R_PHASE
-            phase_changed = True
-
-        # potential-based shaping toward the nearest spawner
-        dist = self._nearest(self.spawners)[0]
-        if not phase_changed:
-            reward += self.R_SHAPE * (self.prev_spawner_dist - dist) / DIAG
-        self.prev_spawner_dist = dist
-
-        terminated = self.hp <= 0.0
-        if terminated:
-            reward += self.R_DEATH
-        truncated = self.steps >= self.max_steps
-
-        info = {"phase": self.phase, "kills": self.kills,
-                "spawners_destroyed": self.spawners_destroyed, "hp": self.hp}
-
-        if self.render_mode == "human":
-            self.render()
-
-        # gymnasium 5-tuple; done = terminated or truncated
-        return self._get_obs(), float(reward), terminated, truncated, info
-
-    def _apply_action(self, action):
-        """Turn the discrete action into movement / shooting. Returns a reward part."""
-        if self.scheme == "rotation":
-            # 0 noop | 1 thrust | 2 rotate left | 3 rotate right | 4 shoot
-            if action == 1:
-                self.vx += math.cos(self.angle) * P_ACCEL * DT
-                self.vy += math.sin(self.angle) * P_ACCEL * DT
-            elif action == 2:
-                self.angle -= P_ROT_SPEED * DT
-            elif action == 3:
-                self.angle += P_ROT_SPEED * DT
-            elif action == 4:
-                return self._shoot(math.cos(self.angle), math.sin(self.angle))
+    # ------------------------------------------------------------------ #
+    def _action_to_control(self, action: int) -> dict:
+        if self.control_scheme == "rotate":
+            # 0 noop, 1 turn_left, 2 turn_right, 3 thrust, 4 fire
+            return {
+                "turn": -1 if action == 1 else (1 if action == 2 else 0),
+                "thrust": 1 if action == 3 else 0,
+                "fire": action == 4,
+            }
         else:
-            # 0 noop | 1 up | 2 down | 3 left | 4 right | 5 shoot
-            move = {1: (0, -1), 2: (0, 1), 3: (-1, 0), 4: (1, 0)}.get(action)
-            if move:
-                self.vx += move[0] * P_ACCEL * DT
-                self.vy += move[1] * P_ACCEL * DT
-                self.aim = move                    # the ship faces where it moves
-                self.angle = math.atan2(move[1], move[0])
-            elif action == 5:
-                return self._shoot(*self.aim)
-        return 0.0
+            # 0 noop, 1 up, 2 down, 3 left, 4 right, 5 fire
+            move_map = {1: (0, -1), 2: (0, 1), 3: (-1, 0), 4: (1, 0)}
+            return {
+                "move": move_map.get(action, (0, 0)),
+                "fire": action == 5,
+            }
 
-    def _shoot(self, dx, dy):
-        """Fire a bullet. Pays a small bonus when the shot is genuinely aimed."""
-        if self.cooldown > 0.0:
+    # ------------------------------------------------------------------ #
+    def _nearest(self, points: list, origin: np.ndarray):
+        """Return (dx, dy, dist) to nearest point in `points`, or a
+        sentinel "far away" value if the list is empty."""
+        if not points:
+            # sentinel: maximum possible distance, zero direction
+            return 0.0, 0.0, 1.0
+        dists = [float(np.linalg.norm(pt - origin)) for pt in points]
+        idx = int(np.argmin(dists))
+        nearest = points[idx]
+        d = dists[idx]
+        max_d = ARENA_SIZE * math.sqrt(2)
+        dx = _norm(nearest[0] - origin[0], ARENA_SIZE)
+        dy = _norm(nearest[1] - origin[1], ARENA_SIZE)
+        return dx, dy, _clamp01(d / max_d)
+
+    def _build_observation(self) -> np.ndarray:
+        s = self.sim.get_state_dict()
+        px, py = s["player_pos"]
+        vx, vy = s["player_vel"]
+
+        edx, edy, edist = self._nearest(s["enemies"], s["player_pos"])
+        if self.include_spawner_feature:
+            sdx, sdy, sdist = self._nearest(s["spawners"], s["player_pos"])
+        else:
+            sdx, sdy, sdist = 0.0, 0.0, 1.0
+
+        obs = np.array([
+            _norm(px, ARENA_SIZE),                                   # 1 player x
+            _norm(py, ARENA_SIZE),                                   # 2 player y
+            _clamp(vx / MAX_SPEED, -1.0, 1.0),                       # 3 vx
+            _clamp(vy / MAX_SPEED, -1.0, 1.0),                       # 4 vy
+            _clamp(s["player_angle"] / math.pi, -1.0, 1.0),          # 5 angle
+            edx, edy, edist,                                        # 6-8 nearest enemy
+            sdx, sdy, sdist,                                         # 9-11 nearest spawner
+            _clamp01(s["player_hp"] / PLAYER_MAX_HP) * 2 - 1,        # 12 health
+            _clamp01(s["n_enemies"] / MAX_ENEMIES_EXPECTED) * 2 - 1,  # 13 enemy count
+            _clamp01(s["phase_index"] / max(1, s["n_phases"] - 1)) * 2 - 1,  # 14 phase
+            _clamp01(s["time_remaining"] / self.sim.max_time) * 2 - 1,  # 15 time left
+        ], dtype=np.float32)
+        return obs
+
+    def _potential(self) -> float:
+        """Phi(s) = -k * dist(player, nearest active spawner).
+        0 if no spawners remain (about to transition phase / episode end)
+        or if the spawner feature is ablated (Part III option)."""
+        if not self.include_spawner_feature:
             return 0.0
-        self.cooldown = SHOOT_COOLDOWN
-        self.bullets.append(Bullet(self.px + dx * P_RADIUS, self.py + dy * P_RADIUS, dx, dy))
+        s = self.sim.get_state_dict()
+        if not s["spawners"]:
+            return 0.0
+        dists = [float(np.linalg.norm(sp - s["player_pos"])) for sp in s["spawners"]]
+        return -self.shaping_k * min(dists)
 
-        # bonus if the shot points within ~18 degrees of the closest target
-        best = 0.0
-        for o in self.enemies + self.spawners:
-            ox, oy = o.x - self.px, o.y - self.py
-            d = math.hypot(ox, oy) + 1e-8
-            best = max(best, (ox / d) * dx + (oy / d) * dy)
-        return self.R_AIM if best > 0.95 else 0.0
-
-    def _move_player(self):
-        """Drag, speed limit and walls."""
-        self.vx -= self.vx * P_DRAG * DT
-        self.vy -= self.vy * P_DRAG * DT
-        sp = math.hypot(self.vx, self.vy)
-        if sp > P_MAX_SPEED:
-            self.vx, self.vy = self.vx / sp * P_MAX_SPEED, self.vy / sp * P_MAX_SPEED
-        self.px += self.vx * DT
-        self.py += self.vy * DT
-        # bounce softly off the borders
-        if self.px < P_RADIUS or self.px > WIDTH - P_RADIUS:
-            self.px = min(max(self.px, P_RADIUS), WIDTH - P_RADIUS)
-            self.vx *= -0.4
-        if self.py < P_RADIUS or self.py > HEIGHT - P_RADIUS:
-            self.py = min(max(self.py, P_RADIUS), HEIGHT - P_RADIUS)
-            self.vy *= -0.4
-
-    def _update_bullets(self):
-        """Move bullets, apply damage, remove dead objects. Returns a reward part."""
-        reward = 0.0
-        alive = []
-        for b in self.bullets:
-            b.update(DT)
-            if b.life <= 0 or not (0 <= b.x <= WIDTH and 0 <= b.y <= HEIGHT):
-                continue
-            hit = False
-            for e in self.enemies:                       # bullet vs enemy
-                if math.hypot(b.x - e.x, b.y - e.y) < E_RADIUS + B_RADIUS:
-                    e.hp -= B_DAMAGE
-                    reward += self.R_HIT
-                    hit = True
-                    if e.hp <= 0:
-                        reward += self.R_ENEMY_KILL
-                        self.kills += 1
-                    break
-            if not hit:
-                for s in self.spawners:                  # bullet vs spawner
-                    if math.hypot(b.x - s.x, b.y - s.y) < S_RADIUS + B_RADIUS:
-                        s.hp -= B_DAMAGE
-                        reward += self.R_HIT
-                        hit = True
-                        if s.hp <= 0:
-                            reward += self.R_SPAWNER_KILL
-                            self.spawners_destroyed += 1
-                        break
-            if not hit:
-                alive.append(b)
-        self.bullets = alive
-        self.enemies = [e for e in self.enemies if e.hp > 0]
-        self.spawners = [s for s in self.spawners if s.hp > 0]
-        return reward
-
-    def _update_enemies(self):
-        """Chase the player and damage it on contact. Returns a reward part."""
-        reward = 0.0
-        for e in self.enemies:
-            e.update(DT, self.px, self.py)
-            if math.hypot(e.x - self.px, e.y - self.py) < E_RADIUS + P_RADIUS and e.touch_cd <= 0:
-                self.hp -= E_TOUCH_DAMAGE
-                e.touch_cd = E_TOUCH_COOLDOWN
-                reward += self.R_DAMAGE * E_TOUCH_DAMAGE
-        self.hp = max(0.0, self.hp)
-        return reward
-
-    def _update_spawners(self):
-        """Spawners release enemies until the global cap is reached."""
-        speed = E_BASE_SPEED + 10.0 * (self.phase - 1)
-        for s in self.spawners:
-            if s.update(DT) and len(self.enemies) < MAX_ENEMIES:
-                a = self.np_random.uniform(0, 2 * math.pi)
-                self.enemies.append(Enemy(s.x + math.cos(a) * 30,
-                                          s.y + math.sin(a) * 30, speed))
-
-    # ------------------------------------------------------------------
-    # observation
-    # ------------------------------------------------------------------
-    def _nearest(self, objects):
-        """Distance and unit direction to the closest object in a list."""
-        best, bx, by = DIAG, 0.0, 0.0
-        for o in objects:
-            dx, dy = o.x - self.px, o.y - self.py
-            d = math.hypot(dx, dy)
-            if d < best:
-                best, bx, by = d, dx, dy
-        if best >= DIAG:
-            return DIAG, 0.0, 0.0
-        return best, bx / (best + 1e-8), by / (best + 1e-8)
-
-    def _get_obs(self):
-        """Fixed size vector of 24 normalised floats (no pixels)."""
-        e_dist, e_dx, e_dy = self._nearest(self.enemies)
-        s_dist, s_dx, s_dy = self._nearest(self.spawners)
-
-        # direction to the target expressed in the ship's own frame
-        ca, sa = math.cos(-self.angle), math.sin(-self.angle)
-        e_rx, e_ry = e_dx * ca - e_dy * sa, e_dx * sa + e_dy * ca
-        s_rx, s_ry = s_dx * ca - s_dy * sa, s_dx * sa + s_dy * ca
-
-        wall = min(self.px, WIDTH - self.px, self.py, HEIGHT - self.py)
-
-        obs = [
-            self.px / WIDTH, self.py / HEIGHT,                  # 0-1  position
-            self.vx / P_MAX_SPEED, self.vy / P_MAX_SPEED,       # 2-3  velocity
-            math.cos(self.angle), math.sin(self.angle),         # 4-5  orientation
-            e_dist / DIAG, e_dx, e_dy, e_rx, e_ry,              # 6-10 nearest enemy
-            1.0 if self.enemies else 0.0,                       # 11   enemy exists
-            s_dist / DIAG, s_dx, s_dy, s_rx, s_ry,              # 12-16 nearest spawner
-            1.0 if self.spawners else 0.0,                      # 17   spawner exists
-            self.hp / P_MAX_HP,                                 # 18   player health
-            self.phase / 10.0,                                  # 19   current phase
-            1.0 if self.cooldown <= 0 else 0.0,                 # 20   can shoot
-            len(self.enemies) / MAX_ENEMIES,                    # 21   enemy count
-            len(self.spawners) / 5.0,                           # 22   spawner count
-            wall / (HEIGHT / 2),                                # 23   distance to wall
-        ]
-        return np.array(obs, dtype=np.float32)
-
-    # ------------------------------------------------------------------
-    # render (evaluation only)
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
     def render(self):
-        """Draw the arena. Only call this during evaluation, never while training."""
-        if self.screen is None:
-            pygame.display.init()          # display + font only (no audio needed)
-            pygame.font.init()
-            pygame.display.set_caption(f"RL Arena - {self.scheme} scheme")
-            self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
-            self.clock = pygame.time.Clock()
-            self.font = pygame.font.SysFont("consolas", 18)
-
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                self.close()
-                return
-
-        self.screen.fill(C_BG)
-
-        # spawners: square + health bar
-        for s in self.spawners:
-            pygame.draw.rect(self.screen, C_SPAWNER,
-                             (s.x - S_RADIUS, s.y - S_RADIUS, S_RADIUS * 2, S_RADIUS * 2), 3)
-            w = int(2 * S_RADIUS * (s.hp / s.max_hp))
-            pygame.draw.rect(self.screen, C_SPAWNER, (s.x - S_RADIUS, s.y - S_RADIUS - 8, w, 4))
-
-        # enemies: circles + health bar
-        for e in self.enemies:
-            pygame.draw.circle(self.screen, C_ENEMY, (int(e.x), int(e.y)), E_RADIUS)
-            w = int(2 * E_RADIUS * (e.hp / E_MAX_HP))
-            pygame.draw.rect(self.screen, C_ENEMY, (e.x - E_RADIUS, e.y - E_RADIUS - 6, w, 3))
-
-        # bullets
-        for b in self.bullets:
-            pygame.draw.circle(self.screen, C_BULLET, (int(b.x), int(b.y)), B_RADIUS)
-
-        # player: triangle pointing at self.angle
-        pts = []
-        for off in (0.0, 2.5, -2.5):
-            a = self.angle + off
-            r = P_RADIUS + (6 if off == 0.0 else 0)
-            pts.append((self.px + math.cos(a) * r, self.py + math.sin(a) * r))
-        pygame.draw.polygon(self.screen, C_PLAYER, pts)
-
-        # HUD
-        pygame.draw.rect(self.screen, (70, 70, 80), (10, 10, 200, 14))
-        pygame.draw.rect(self.screen, (90, 230, 140), (10, 10, int(200 * self.hp / P_MAX_HP), 14))
-        txt = (f"HP {int(self.hp)}  Phase {self.phase}  Spawners {len(self.spawners)}  "
-               f"Enemies {len(self.enemies)}  Kills {self.kills}  Step {self.steps}")
-        self.screen.blit(self.font.render(txt, True, C_TEXT), (10, 32))
-
+        if self.render_mode != "human":
+            return
+        import pygame
+        if self._screen is None:
+            pygame.init()
+            self._screen = pygame.display.set_mode((int(ARENA_SIZE), int(ARENA_SIZE)))
+            pygame.display.set_caption(f"Arena RL — {self.control_scheme}")
+        self.sim.render(self._screen)
         pygame.display.flip()
-        self.clock.tick(FPS)
 
     def close(self):
-        if self.screen is not None:
+        if self._screen is not None:
+            import pygame
             pygame.quit()
-            self.screen = None
+            self._screen = None
 
 
-# quick manual check: random agent, no window
-if __name__ == "__main__":
-    env = ArenaEnv(scheme="rotation")
-    obs, _ = env.reset(seed=0)
-    total = 0.0
-    for _ in range(300):
-        obs, r, term, trunc, info = env.step(env.action_space.sample())
-        total += r
-        if term or trunc:
-            break
-    print("obs shape:", obs.shape, "| reward:", round(total, 2), "| info:", info)
+def _norm(v: float, scale: float) -> float:
+    """Map a coordinate/delta in [-scale, scale] to [-1, 1]."""
+    return float(_clamp(v / scale, -1.0, 1.0))
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def _clamp01(v) -> float:
+    return max(0.0, min(1.0, v))
