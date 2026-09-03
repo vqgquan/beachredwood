@@ -1,0 +1,5 @@
+name,axis,shaping_enabled,include_spawner_feature,net_arch,lr,timesteps,mean_reward,std_reward,train_time_sec,used_best_checkpoint
+baseline,baseline,True,True,64x64,0.0003,800000,-14.05,9.355346065218539,331.4,True
+no_shaping,shaping,False,True,64x64,0.0003,800000,-22.375,0.7048936089935842,305.4,True
+no_spawner_feature,observation,True,False,64x64,0.0003,800000,-22.425,0.2384848003542364,308.1,True
+bigger_network,network,True,True,128x128,0.0003,800000,-4.65,0.39051248379533265,360.3,True
