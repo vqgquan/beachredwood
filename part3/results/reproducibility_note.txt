@@ -1,0 +1,28 @@
+Run-to-run variance at a FIXED seed
+===================================
+
+The seed-0 arm of this study was trained twice, with identical code, identical
+configuration and seed=0 both times. The results were not identical:
+
+  config           run 1     run 2     delta
+  ------------------------------------------
+  baseline        +94.61    +98.31     +3.70
+  no_shaping     +156.16   +156.50     +0.34
+  no_step_cost    +39.72    +49.44     +9.72   (+24% relative)
+  no_ship_frame   -17.63    -16.62     +1.01
+
+Cause: training runs 8 environments in parallel and PyTorch uses multiple
+threads, so the order in which rollout samples are gathered is not fully
+deterministic. Small differences in gradient batches compound over 700k steps.
+
+Consequence for reading this study: setting seed=0 makes a run *approximately*
+repeatable, not bit-identical. A gap of a few reward points between two arms is
+within what a single arm produces against itself, so it is not evidence of a
+difference. This is independent of, and additional to, the between-seed spread
+reported in seed_check.csv -- and it points the same way: only differences much
+larger than this noise floor should be read as effects.
+
+Which files hold which run:
+  ablation_results.csv   run 2 (the run whose learning curves are in logs/ and
+                         ablation_curves.png)
+  seed_check.csv         run 1 for seed 0, plus seeds 1 and 2
