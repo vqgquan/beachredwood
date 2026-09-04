@@ -1,0 +1,5 @@
+name,learning_rate,n_steps,ent_coef,gamma,net,scheme,mean_reward,std_reward
+baseline_defaults,0.0003,2048,0.0,0.99,"[64, 64]",rotation,68.39,52.33
+high_entropy,0.0003,1024,0.01,0.99,"[64, 64]",rotation,116.34,25.71
+high_gamma_bignet,0.0003,1024,0.01,0.995,"[128, 128]",rotation,174.55,96.42
+fast_lr,0.001,1024,0.01,0.995,"[128, 128]",rotation,152.53,17.31
