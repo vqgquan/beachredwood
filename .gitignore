@@ -1,4 +1,4 @@
-/part2/models/checkpoints
+
 
 .note
 
@@ -7,4 +7,5 @@ __pycache__/
 .venv/
 venv/
 
-/part2/models
+
+/part2/models/checkpoints
