@@ -1,5 +1,5 @@
 name,axis,env,timesteps,seed,mean_reward,std_reward,mean_ep_len,mean_kills,mean_spawners,train_time_sec
-baseline,baseline,ArenaEnv,700000,0,98.31,50.53,480.1,11.6,3.5,265.8
-no_shaping,reward: shaping,NoShaping,700000,0,156.5,56.23,283.3,7.95,5.8,245.3
-no_step_cost,reward: time cost,NoStepCost,700000,0,49.44,49.19,295.6,2.45,2.7,260.5
-no_ship_frame,observation,NoShipFrame,700000,0,-16.62,22.14,927,0.45,0.5,256.4
+baseline,baseline,ArenaEnv,700000,0,69.15,31.88,255.1,3.4,3.2,83.4
+no_shaping,reward: shaping,NoShaping,700000,0,53.06,39.22,480.5,3.35,2.75,79.7
+no_step_cost,reward: time cost,NoStepCost,700000,0,84.57,70.07,451.9,7.25,3.35,71.0
+no_ship_frame,observation,NoShipFrame,700000,0,-20.6,12.4,675.5,1.4,0.5,75.7

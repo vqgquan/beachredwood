@@ -1,6 +1,6 @@
 config             reward   ep_len   kills  spawners
 ----------------------------------------------------
-baseline            98.31      480    11.6       3.5
-no_shaping         156.50      283     8.0       5.8
-no_step_cost        49.44      296     2.5       2.7
-no_ship_frame      -16.62      927     0.5       0.5
+baseline            69.15      255     3.4       3.2
+no_shaping          53.06      480     3.4       2.8
+no_step_cost        84.57      452     7.2       3.4
+no_ship_frame      -20.60      676     1.4       0.5
