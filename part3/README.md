@@ -102,3 +102,21 @@ python part3/seed_check.py --seeds 1 2
 ```
 
 Outputs land in `part3/results/`.
+
+---
+
+## 7. Demo
+
+Trained models are committed under `results/models/<arm>/best_model.zip`, so
+no retraining is needed to watch an arm play. `demo_ablation.py` opens a
+window and runs each model in the env it was actually trained on — using
+`part2/evaluate.py` alone would feed `no_ship_frame` inputs it never saw,
+which changes its behaviour.
+
+```bash
+python part3/demo_ablation.py baseline        # fights: kills, spawners
+python part3/demo_ablation.py no_ship_frame   # the arm that learned to run away
+```
+
+`part2/play_human.py --scheme rotation` plays the same arena by keyboard if
+the demo needs a "you try it" moment.
